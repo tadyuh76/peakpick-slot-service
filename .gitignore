@@ -4,6 +4,9 @@ __pycache__/
 .venv/
 venv/
 node_modules/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
 dist/
 build/
 .env
