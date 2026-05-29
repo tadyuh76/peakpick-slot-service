@@ -6,7 +6,9 @@ from services.order_service.main import carts, handle_order_lifecycle_event, ord
 from services.slot_service.main import SLOT_COUNT
 from services.slot_service.main import app as slot_app
 from services.slot_service.main import assign_slot
+from services.slot_service.main import blocked_orders
 from services.slot_service.main import handle_order_paid, reservations
+from services.slot_service.main import handle_status_event as handle_slot_status_event
 from shared.event_bus import InMemoryEventBus
 from shared.events import EventType, new_event
 
@@ -97,6 +99,33 @@ async def test_order_service_reflects_slot_and_pickup_lifecycle_events() -> None
 
 
 @pytest.mark.asyncio
+async def test_order_service_marks_inventory_shortage_status() -> None:
+    state = {
+        "order-shortage": {
+            "order_id": "order-shortage",
+            "customer_name": "Huy",
+            "items": [{"sku": "coffee", "quantity": 99}],
+            "pickup_window": "12:00-12:15",
+            "payment_status": "Paid",
+            "order_status": "Paid",
+            "paid_at": "2026-06-09T12:00:00+00:00",
+        }
+    }
+
+    await handle_order_lifecycle_event(
+        new_event(
+            EventType.INVENTORY_SHORTAGE_DETECTED,
+            aggregate_id="order-shortage",
+            source="inventory-service",
+            payload={"shortages": [{"sku": "coffee", "requested": 99, "available": 0}]},
+        ),
+        state,
+    )
+
+    assert state["order-shortage"]["order_status"] == "InventoryShortage"
+
+
+@pytest.mark.asyncio
 async def test_slot_service_publishes_slot_full_when_window_has_no_capacity() -> None:
     bus = InMemoryEventBus()
     await bus.connect()
@@ -129,6 +158,70 @@ async def test_slot_service_publishes_slot_full_when_window_has_no_capacity() ->
 
     assert bus.history[-1].event_type == EventType.PICKUP_SLOT_FULL
     assert "order-full" not in slot_state
+
+
+@pytest.mark.asyncio
+async def test_slot_service_releases_reservation_when_inventory_shortage_arrives() -> None:
+    slot_state = {
+        "order-shortage": {
+            "order_id": "order-shortage",
+            "slot_id": "P-03",
+            "pickup_window": "12:00-12:15",
+            "status": "Reserved",
+            "reserved_at": "2026-06-09T12:00:00+00:00",
+        }
+    }
+    blocked_orders.clear()
+
+    await handle_slot_status_event(
+        new_event(
+            EventType.INVENTORY_SHORTAGE_DETECTED,
+            aggregate_id="order-shortage",
+            source="inventory-service",
+            payload={"shortages": [{"sku": "coffee", "requested": 99, "available": 0}]},
+        ),
+        slot_state,
+    )
+
+    assert slot_state["order-shortage"]["status"] == "Available"
+    assert slot_state["order-shortage"]["released_at"]
+    assert "order-shortage" in blocked_orders
+
+
+@pytest.mark.asyncio
+async def test_slot_service_does_not_reserve_after_early_inventory_shortage() -> None:
+    bus = InMemoryEventBus()
+    await bus.connect()
+    slot_state: dict[str, dict[str, object]] = {}
+    blocked_orders.clear()
+
+    await handle_slot_status_event(
+        new_event(
+            EventType.INVENTORY_SHORTAGE_DETECTED,
+            aggregate_id="order-shortage",
+            source="inventory-service",
+            payload={"shortages": [{"sku": "coffee", "requested": 99, "available": 0}]},
+        ),
+        slot_state,
+    )
+    await handle_order_paid(
+        new_event(
+            EventType.ORDER_PAID,
+            aggregate_id="order-shortage",
+            source="order-service",
+            payload={
+                "order_id": "order-shortage",
+                "customer_name": "Huy",
+                "pickup_window": "12:00-12:15",
+                "items": [{"sku": "coffee", "quantity": 99}],
+            },
+        ),
+        bus,
+        slot_state,
+    )
+
+    assert slot_state == {}
+    assert bus.history == []
 
 
 def test_slot_service_exposes_demo_capacity_metadata() -> None:

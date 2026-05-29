@@ -16,6 +16,7 @@ from shared.settings import get_settings
 settings = get_settings("slot-service")
 logger = configure_logging(settings.service_name)
 reservations: dict[str, dict[str, object]] = {}
+blocked_orders: set[str] = set()
 SLOT_COUNT = 8
 DEFAULT_PICKUP_WINDOWS = [
     {"pickup_window": "09:30-09:35", "capacity": SLOT_COUNT, "active": True},
@@ -66,6 +67,49 @@ def _get_reservation_sync(order_id: str) -> dict[str, object] | None:
             (order_id,),
         ).fetchone()
         return dict(row) if row else None
+
+
+async def _is_order_blocked(order_id: str) -> bool:
+    if not _database_enabled():
+        return order_id in blocked_orders
+    return await asyncio.to_thread(_is_order_blocked_sync, order_id)
+
+
+def _is_order_blocked_sync(order_id: str) -> bool:
+    import psycopg
+
+    with psycopg.connect(settings.database_url) as conn:
+        row = conn.execute(
+            """
+            SELECT order_id
+            FROM slot_reservation_blocks
+            WHERE order_id = %s
+            """,
+            (order_id,),
+        ).fetchone()
+        return row is not None
+
+
+async def _block_order_reservation(order_id: str, reason: str) -> None:
+    if not _database_enabled():
+        blocked_orders.add(order_id)
+        return
+    await asyncio.to_thread(_block_order_reservation_sync, order_id, reason)
+
+
+def _block_order_reservation_sync(order_id: str, reason: str) -> None:
+    import psycopg
+
+    with psycopg.connect(settings.database_url) as conn:
+        conn.execute(
+            """
+            INSERT INTO slot_reservation_blocks (order_id, reason)
+            VALUES (%s, %s)
+            ON CONFLICT (order_id) DO UPDATE
+                SET reason = EXCLUDED.reason
+            """,
+            (order_id, reason),
+        )
 
 
 async def _used_slots_for_window(pickup_window: str) -> set[str]:
@@ -152,6 +196,17 @@ def _reserve_slot_for_order_sync(order_id: str, pickup_window: str) -> dict[str,
             # Same-window reservations must be serialized so two paid orders
             # cannot choose the same physical slot before either insert commits.
             conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (pickup_window,))
+            blocked = conn.execute(
+                """
+                SELECT order_id
+                FROM slot_reservation_blocks
+                WHERE order_id = %s
+                """,
+                (order_id,),
+            ).fetchone()
+            if blocked:
+                return None
+
             existing = conn.execute(
                 """
                 SELECT order_id
@@ -314,10 +369,14 @@ async def handle_order_paid(
     if _database_enabled():
         if await _get_reservation(event.aggregate_id):
             return
+        if await _is_order_blocked(event.aggregate_id):
+            return
         pickup_window = event.payload["pickup_window"]
         reservation = await _reserve_slot_for_order(event.aggregate_id, str(pickup_window))
         slot_id = reservation["slot_id"] if reservation else None
     elif event.aggregate_id in state:
+        return
+    elif event.aggregate_id in blocked_orders:
         return
     else:
         pickup_window = event.payload["pickup_window"]
@@ -362,19 +421,29 @@ async def handle_status_event(
     state: dict[str, dict[str, object]] = reservations,
 ) -> None:
     reservation = await _get_reservation(event.aggregate_id) if _database_enabled() else state.get(event.aggregate_id)
-    if not reservation:
-        return
     event_type = EventType(event.event_type)
+    if event_type == EventType.INVENTORY_SHORTAGE_DETECTED:
+        await _block_order_reservation(event.aggregate_id, "InventoryShortageDetected")
+        if not reservation:
+            return
+    elif not reservation:
+        return
+
     status_by_event = {
         EventType.ORDER_PREPARING: "Preparing",
         EventType.ORDER_PLACED_IN_SLOT: "PlacedInSlot",
         EventType.ORDER_READY: "Ready",
         EventType.ORDER_PICKED_UP: "Available",
         EventType.ORDER_EXPIRED: "Available",
+        EventType.INVENTORY_SHORTAGE_DETECTED: "Available",
     }
     status = status_by_event.get(event_type, str(reservation["status"]))
     released_at = None
-    if event_type in {EventType.ORDER_PICKED_UP, EventType.ORDER_EXPIRED}:
+    if event_type in {
+        EventType.ORDER_PICKED_UP,
+        EventType.ORDER_EXPIRED,
+        EventType.INVENTORY_SHORTAGE_DETECTED,
+    }:
         released_at = datetime.now(UTC).isoformat()
     if _database_enabled():
         await _update_reservation_status(event.aggregate_id, status, released_at)
@@ -399,6 +468,7 @@ async def lifespan(app: FastAPI):
         EventType.ORDER_READY,
         EventType.ORDER_PICKED_UP,
         EventType.ORDER_EXPIRED,
+        EventType.INVENTORY_SHORTAGE_DETECTED,
     ):
         await event_bus.subscribe(
             event_type,
