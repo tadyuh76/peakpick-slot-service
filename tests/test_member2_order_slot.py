@@ -45,6 +45,20 @@ def test_order_service_creates_cart_and_paid_order() -> None:
         assert fetched_response.json()["items"] == [{"sku": "coffee", "quantity": 2}]
 
 
+def test_order_service_rejects_checkout_without_items() -> None:
+    with TestClient(order_app) as client:
+        response = client.post(
+            "/checkout",
+            json={
+                "customer_name": "Huy",
+                "pickup_window": "12:00-12:15",
+                "items": [],
+            },
+        )
+
+    assert response.status_code == 422
+
+
 @pytest.mark.asyncio
 async def test_order_service_reflects_slot_and_pickup_lifecycle_events() -> None:
     state = {
