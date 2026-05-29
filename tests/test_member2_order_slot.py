@@ -5,6 +5,7 @@ from services.order_service.main import app as order_app
 from services.order_service.main import carts, handle_order_lifecycle_event, orders
 from services.slot_service.main import SLOT_COUNT
 from services.slot_service.main import app as slot_app
+from services.slot_service.main import assign_slot
 from services.slot_service.main import handle_order_paid, reservations
 from shared.event_bus import InMemoryEventBus
 from shared.events import EventType, new_event
@@ -126,3 +127,24 @@ def test_slot_service_exposes_demo_capacity_metadata() -> None:
     assert windows_response.status_code == 200
     assert {"pickup_window": "12:00-12:15", "capacity": 8, "active": True} in windows_response.json()
     assert len(slots_response.json()) == 8
+
+
+def test_slot_capacity_is_scoped_to_each_pickup_window() -> None:
+    state = {
+        f"morning-{index}": {
+            "order_id": f"morning-{index}",
+            "slot_id": f"P-{index + 1:02d}",
+            "pickup_window": "09:30-09:35",
+            "status": "Reserved",
+        }
+        for index in range(SLOT_COUNT)
+    }
+
+    assert assign_slot("lunch-order", "12:00-12:15", state) is not None
+
+
+def test_schema_prevents_active_double_booking_for_same_slot_window() -> None:
+    schema_sql = open("db/init.sql", encoding="utf-8").read()
+
+    assert "idx_slot_reservations_active_slot_window" in schema_sql
+    assert "WHERE status <> 'Available'" in schema_sql

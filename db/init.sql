@@ -69,6 +69,10 @@ CREATE TABLE IF NOT EXISTS slot_reservations (
 CREATE INDEX IF NOT EXISTS idx_slot_reservations_pickup_window_status
     ON slot_reservations (pickup_window, status);
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_slot_reservations_active_slot_window
+    ON slot_reservations (pickup_window, slot_id)
+    WHERE status <> 'Available';
+
 INSERT INTO pickup_windows (pickup_window, capacity)
 VALUES
     ('09:30-09:35', 8),

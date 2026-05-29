@@ -140,6 +140,83 @@ def _save_reservation_sync(reservation: dict[str, object]) -> None:
             )
 
 
+async def _reserve_slot_for_order(order_id: str, pickup_window: str) -> dict[str, object] | None:
+    return await asyncio.to_thread(_reserve_slot_for_order_sync, order_id, pickup_window)
+
+
+def _reserve_slot_for_order_sync(order_id: str, pickup_window: str) -> dict[str, object] | None:
+    import psycopg
+
+    with psycopg.connect(settings.database_url) as conn:
+        with conn.transaction():
+            # Same-window reservations must be serialized so two paid orders
+            # cannot choose the same physical slot before either insert commits.
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (pickup_window,))
+            existing = conn.execute(
+                """
+                SELECT order_id
+                FROM slot_reservations
+                WHERE order_id = %s
+                """,
+                (order_id,),
+            ).fetchone()
+            if existing:
+                return None
+
+            used_rows = conn.execute(
+                """
+                SELECT slot_id
+                FROM slot_reservations
+                WHERE pickup_window = %s
+                  AND status <> 'Available'
+                """,
+                (pickup_window,),
+            ).fetchall()
+            slot_id = _pick_available_slot(order_id, {str(row[0]) for row in used_rows})
+            if slot_id is None:
+                return None
+
+            reservation = {
+                "order_id": order_id,
+                "slot_id": slot_id,
+                "pickup_window": pickup_window,
+                "status": "Reserved",
+                "reserved_at": datetime.now(UTC).isoformat(),
+            }
+            conn.execute(
+                """
+                INSERT INTO pickup_windows (pickup_window, capacity)
+                VALUES (%s, %s)
+                ON CONFLICT (pickup_window) DO NOTHING
+                """,
+                (pickup_window, SLOT_COUNT),
+            )
+            conn.execute(
+                """
+                INSERT INTO pickup_slots (slot_id)
+                VALUES (%s)
+                ON CONFLICT (slot_id) DO NOTHING
+                """,
+                (slot_id,),
+            )
+            conn.execute(
+                """
+                INSERT INTO slot_reservations (
+                    order_id, slot_id, pickup_window, status, reserved_at
+                )
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    reservation["order_id"],
+                    reservation["slot_id"],
+                    reservation["pickup_window"],
+                    reservation["status"],
+                    reservation["reserved_at"],
+                ),
+            )
+            return reservation
+
+
 async def _update_reservation_status(order_id: str, status: str, released_at: str | None = None) -> None:
     if not _database_enabled():
         reservation = reservations.get(order_id)
@@ -238,8 +315,8 @@ async def handle_order_paid(
         if await _get_reservation(event.aggregate_id):
             return
         pickup_window = event.payload["pickup_window"]
-        used_slots = await _used_slots_for_window(str(pickup_window))
-        slot_id = _pick_available_slot(event.aggregate_id, used_slots)
+        reservation = await _reserve_slot_for_order(event.aggregate_id, str(pickup_window))
+        slot_id = reservation["slot_id"] if reservation else None
     elif event.aggregate_id in state:
         return
     else:
@@ -259,16 +336,14 @@ async def handle_order_paid(
         log_event(logger, settings.service_name, "pickup slot full", order_id=event.aggregate_id)
         return
 
-    reservation = {
-        "order_id": event.aggregate_id,
-        "slot_id": slot_id,
-        "pickup_window": pickup_window,
-        "status": "Reserved",
-        "reserved_at": datetime.now(UTC).isoformat(),
-    }
-    if _database_enabled():
-        await _save_reservation(reservation)
-    else:
+    if not _database_enabled():
+        reservation = {
+            "order_id": event.aggregate_id,
+            "slot_id": slot_id,
+            "pickup_window": pickup_window,
+            "status": "Reserved",
+            "reserved_at": datetime.now(UTC).isoformat(),
+        }
         state[event.aggregate_id] = reservation
     await event_bus.publish(
         new_event(
