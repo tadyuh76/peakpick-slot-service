@@ -161,6 +161,40 @@ async def test_slot_service_publishes_slot_full_when_window_has_no_capacity() ->
 
 
 @pytest.mark.asyncio
+async def test_slot_service_ignores_duplicate_order_paid_for_existing_reservation() -> None:
+    bus = InMemoryEventBus()
+    await bus.connect()
+    slot_state = {
+        "order-duplicate": {
+            "order_id": "order-duplicate",
+            "slot_id": "P-01",
+            "pickup_window": "12:00-12:15",
+            "status": "Reserved",
+            "reserved_at": "2026-06-09T12:00:00+00:00",
+        }
+    }
+
+    await handle_order_paid(
+        new_event(
+            EventType.ORDER_PAID,
+            aggregate_id="order-duplicate",
+            source="order-service",
+            payload={
+                "order_id": "order-duplicate",
+                "customer_name": "Huy",
+                "pickup_window": "12:00-12:15",
+                "items": [{"sku": "coffee", "quantity": 1}],
+            },
+        ),
+        bus,
+        slot_state,
+    )
+
+    assert bus.history == []
+    assert slot_state["order-duplicate"]["slot_id"] == "P-01"
+
+
+@pytest.mark.asyncio
 async def test_slot_service_releases_reservation_when_inventory_shortage_arrives() -> None:
     slot_state = {
         "order-shortage": {

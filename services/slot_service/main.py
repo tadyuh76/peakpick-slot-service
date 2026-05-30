@@ -184,11 +184,11 @@ def _save_reservation_sync(reservation: dict[str, object]) -> None:
             )
 
 
-async def _reserve_slot_for_order(order_id: str, pickup_window: str) -> dict[str, object] | None:
+async def _reserve_slot_for_order(order_id: str, pickup_window: str) -> tuple[dict[str, object] | None, bool]:
     return await asyncio.to_thread(_reserve_slot_for_order_sync, order_id, pickup_window)
 
 
-def _reserve_slot_for_order_sync(order_id: str, pickup_window: str) -> dict[str, object] | None:
+def _reserve_slot_for_order_sync(order_id: str, pickup_window: str) -> tuple[dict[str, object] | None, bool]:
     import psycopg
 
     with psycopg.connect(settings.database_url) as conn:
@@ -205,7 +205,7 @@ def _reserve_slot_for_order_sync(order_id: str, pickup_window: str) -> dict[str,
                 (order_id,),
             ).fetchone()
             if blocked:
-                return None
+                return None, True
 
             existing = conn.execute(
                 """
@@ -216,7 +216,7 @@ def _reserve_slot_for_order_sync(order_id: str, pickup_window: str) -> dict[str,
                 (order_id,),
             ).fetchone()
             if existing:
-                return None
+                return None, True
 
             used_rows = conn.execute(
                 """
@@ -229,7 +229,7 @@ def _reserve_slot_for_order_sync(order_id: str, pickup_window: str) -> dict[str,
             ).fetchall()
             slot_id = _pick_available_slot(order_id, {str(row[0]) for row in used_rows})
             if slot_id is None:
-                return None
+                return None, False
 
             reservation = {
                 "order_id": order_id,
@@ -269,7 +269,7 @@ def _reserve_slot_for_order_sync(order_id: str, pickup_window: str) -> dict[str,
                     reservation["reserved_at"],
                 ),
             )
-            return reservation
+            return reservation, False
 
 
 async def _update_reservation_status(order_id: str, status: str, released_at: str | None = None) -> None:
@@ -372,7 +372,9 @@ async def handle_order_paid(
         if await _is_order_blocked(event.aggregate_id):
             return
         pickup_window = event.payload["pickup_window"]
-        reservation = await _reserve_slot_for_order(event.aggregate_id, str(pickup_window))
+        reservation, already_handled = await _reserve_slot_for_order(event.aggregate_id, str(pickup_window))
+        if already_handled:
+            return
         slot_id = reservation["slot_id"] if reservation else None
     elif event.aggregate_id in state:
         return
