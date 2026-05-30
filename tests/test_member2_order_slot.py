@@ -140,6 +140,33 @@ async def test_order_service_marks_inventory_shortage_status() -> None:
 
 
 @pytest.mark.asyncio
+async def test_order_service_ignores_stale_events_after_completed() -> None:
+    state = {
+        "order-regress": {
+            "order_id": "order-regress",
+            "customer_name": "Huy",
+            "items": [{"sku": "water", "quantity": 1}],
+            "pickup_window": "12:00-12:15",
+            "payment_status": "Paid",
+            "order_status": "Completed",
+            "paid_at": "2026-06-09T12:00:00+00:00",
+        }
+    }
+
+    await handle_order_lifecycle_event(
+        new_event(
+            EventType.ORDER_READY,
+            aggregate_id="order-regress",
+            source="store-ops-service",
+            payload={"slot_id": "P-01"},
+        ),
+        state,
+    )
+
+    assert state["order-regress"]["order_status"] == "Completed"
+
+
+@pytest.mark.asyncio
 async def test_slot_service_publishes_slot_full_when_window_has_no_capacity() -> None:
     bus = InMemoryEventBus()
     await bus.connect()
