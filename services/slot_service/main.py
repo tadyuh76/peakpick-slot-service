@@ -18,6 +18,13 @@ logger = configure_logging(settings.service_name)
 reservations: dict[str, dict[str, object]] = {}
 blocked_orders: set[str] = set()
 SLOT_COUNT = 8
+SLOT_STATUS_RANK = {
+    "Reserved": 0,
+    "Preparing": 1,
+    "PlacedInSlot": 2,
+    "Ready": 3,
+    "Available": 4,
+}
 DEFAULT_PICKUP_WINDOWS = [
     {"pickup_window": "09:30-09:35", "capacity": SLOT_COUNT, "active": True},
     {"pickup_window": "12:00-12:15", "capacity": SLOT_COUNT, "active": True},
@@ -276,6 +283,9 @@ async def _update_reservation_status(order_id: str, status: str, released_at: st
     if not _database_enabled():
         reservation = reservations.get(order_id)
         if reservation:
+            current_status = str(reservation.get("status", ""))
+            if not _can_transition_slot_status(current_status, status):
+                return
             reservation["status"] = status
             if released_at:
                 reservation["released_at"] = released_at
@@ -283,19 +293,43 @@ async def _update_reservation_status(order_id: str, status: str, released_at: st
     await asyncio.to_thread(_update_reservation_status_sync, order_id, status, released_at)
 
 
+def _can_transition_slot_status(current_status: str, next_status: str) -> bool:
+    if current_status == next_status:
+        return True
+    if current_status == "Available":
+        return False
+    current_rank = SLOT_STATUS_RANK.get(current_status)
+    next_rank = SLOT_STATUS_RANK.get(next_status)
+    if current_rank is None or next_rank is None:
+        return True
+    return next_rank >= current_rank
+
+
 def _update_reservation_status_sync(order_id: str, status: str, released_at: str | None = None) -> None:
     import psycopg
 
     with psycopg.connect(settings.database_url) as conn:
-        conn.execute(
-            """
-            UPDATE slot_reservations
-            SET status = %s,
-                released_at = COALESCE(%s, released_at)
-            WHERE order_id = %s
-            """,
-            (status, released_at, order_id),
-        )
+        with conn.transaction():
+            row = conn.execute(
+                """
+                SELECT status
+                FROM slot_reservations
+                WHERE order_id = %s
+                FOR UPDATE
+                """,
+                (order_id,),
+            ).fetchone()
+            if row is None or not _can_transition_slot_status(str(row[0]), status):
+                return
+            conn.execute(
+                """
+                UPDATE slot_reservations
+                SET status = %s,
+                    released_at = COALESCE(%s, released_at)
+                WHERE order_id = %s
+                """,
+                (status, released_at, order_id),
+            )
 
 
 async def _list_reservations() -> list[dict[str, object]]:
@@ -450,6 +484,8 @@ async def handle_status_event(
     if _database_enabled():
         await _update_reservation_status(event.aggregate_id, status, released_at)
     else:
+        if not _can_transition_slot_status(str(reservation.get("status", "")), status):
+            return
         reservation["status"] = status
         if released_at:
             reservation["released_at"] = released_at

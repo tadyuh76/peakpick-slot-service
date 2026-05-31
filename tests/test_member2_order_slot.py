@@ -264,6 +264,32 @@ async def test_slot_service_releases_reservation_when_inventory_shortage_arrives
 
 
 @pytest.mark.asyncio
+async def test_slot_service_ignores_stale_events_after_slot_release() -> None:
+    slot_state = {
+        "order-regress": {
+            "order_id": "order-regress",
+            "slot_id": "P-03",
+            "pickup_window": "12:00-12:15",
+            "status": "Available",
+            "reserved_at": "2026-06-09T12:00:00+00:00",
+            "released_at": "2026-06-09T12:05:00+00:00",
+        }
+    }
+
+    await handle_slot_status_event(
+        new_event(
+            EventType.ORDER_READY,
+            aggregate_id="order-regress",
+            source="store-ops-service",
+            payload={"slot_id": "P-03"},
+        ),
+        slot_state,
+    )
+
+    assert slot_state["order-regress"]["status"] == "Available"
+
+
+@pytest.mark.asyncio
 async def test_slot_service_does_not_reserve_after_early_inventory_shortage() -> None:
     bus = InMemoryEventBus()
     await bus.connect()
