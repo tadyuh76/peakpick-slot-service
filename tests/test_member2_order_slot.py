@@ -333,8 +333,25 @@ def test_slot_service_exposes_demo_capacity_metadata() -> None:
         slots_response = client.get("/slots")
 
     assert windows_response.status_code == 200
-    assert {"pickup_window": "12:00-12:15", "capacity": 8, "active": True} in windows_response.json()
-    assert len(slots_response.json()) == 8
+    assert {"pickup_window": "12:00-12:15", "capacity": 32, "active": True} in windows_response.json()
+    assert len(slots_response.json()) == 32
+
+
+def test_slot_service_updates_pickup_window_capacity() -> None:
+    reservations.clear()
+    from services.slot_service.main import pickup_window_capacity_overrides
+
+    pickup_window_capacity_overrides.clear()
+    try:
+        with TestClient(slot_app) as client:
+            update_response = client.patch("/pickup-windows/12:00-12:15", json={"capacity": 12})
+            windows_response = client.get("/pickup-windows")
+
+        assert update_response.status_code == 200
+        assert update_response.json()["capacity"] == 12
+        assert {"pickup_window": "12:00-12:15", "capacity": 12, "active": True} in windows_response.json()
+    finally:
+        pickup_window_capacity_overrides.clear()
 
 
 def test_slot_capacity_is_scoped_to_each_pickup_window() -> None:

@@ -81,12 +81,12 @@ CREATE TABLE IF NOT EXISTS slot_reservation_blocks (
 
 INSERT INTO pickup_windows (pickup_window, capacity)
 VALUES
-    ('09:30-09:35', 8),
-    ('12:00-12:15', 8),
-    ('17:30-17:45', 8)
+    ('09:30-09:35', 32),
+    ('12:00-12:15', 32),
+    ('17:30-17:45', 32)
 ON CONFLICT (pickup_window) DO NOTHING;
 
 INSERT INTO pickup_slots (slot_id)
 SELECT 'P-' || lpad(value::text, 2, '0')
-FROM generate_series(1, 8) AS value
+FROM generate_series(1, 32) AS value
 ON CONFLICT (slot_id) DO NOTHING;
