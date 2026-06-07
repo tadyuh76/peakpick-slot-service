@@ -29,7 +29,7 @@ async def test_order_paid_drives_pickup_flow_until_slot_is_released() -> None:
 
     slot_state: dict[str, dict[str, object]] = {}
     inventory_stock = {"coffee": 3, "water": 5}
-    inventory_reservations: dict[str, list[dict[str, object]]] = {}
+    inventory_reservations: dict[str, dict[str, object]] = {}
     staff_board: dict[str, dict[str, object]] = {}
     notifications: list[dict[str, object]] = []
 
@@ -73,7 +73,8 @@ async def test_order_paid_drives_pickup_flow_until_slot_is_released() -> None:
     await bus.publish(order_paid)
 
     assert inventory_stock["coffee"] == 1
-    assert inventory_reservations["order-100"] == [{"sku": "coffee", "quantity": 2}]
+    assert inventory_reservations["order-100"]["items"] == [{"sku": "coffee", "quantity": 2}]
+    assert inventory_reservations["order-100"]["status"] == "Reserved"
     assert slot_state["order-100"]["status"] == "Reserved"
     assert staff_board["order-100"]["status"] == "SlotAssigned"
     assert staff_board["order-100"]["correlation_id"] == order_paid.correlation_id
