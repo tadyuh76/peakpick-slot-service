@@ -1,12 +1,16 @@
+from datetime import UTC, datetime
+
 import pytest
 from fastapi import HTTPException
 
 from services.analytics_service.main import event_counts, handle_any_event, recent_events
 from services.inventory_service.main import handle_order_paid as reserve_inventory
+from services.notification_service.main import _notification_from_event_row
 from services.notification_service.main import handle_inventory_shortage, handle_notification_requested
 from services.slot_service.main import handle_order_paid as reserve_slot
 from services.slot_service.main import handle_status_event
 from services.store_ops_service.main import (
+    _apply_board_event,
     handle_pickup_slot_reserved,
     mark_preparing,
     mark_ready,
@@ -151,3 +155,51 @@ async def test_pickup_verification_rejects_wrong_token() -> None:
         await verify_pickup("order-100", "bad-token", bus, staff_board)
 
     assert exc_info.value.status_code == 400
+
+
+def test_store_board_projection_can_rebuild_from_event_rows() -> None:
+    state: dict[str, dict[str, object]] = {}
+    occurred_at = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+
+    _apply_board_event(
+        state,
+        "PickupSlotReserved",
+        "order-100",
+        "33333333-3333-3333-3333-333333333333",
+        {"slot_id": "P-01", "pickup_window": "12:00-12:15"},
+        occurred_at,
+    )
+    _apply_board_event(
+        state,
+        "OrderReady",
+        "order-100",
+        "33333333-3333-3333-3333-333333333333",
+        {"slot_id": "P-01", "pickup_window": "12:00-12:15", "token": "PK-123456"},
+        occurred_at,
+    )
+
+    assert state["order-100"]["status"] == "ReadyForPickup"
+    assert state["order-100"]["slot_id"] == "P-01"
+    assert state["order-100"]["token"] == "PK-123456"
+
+
+def test_notification_projection_can_rebuild_ready_message_from_event_row() -> None:
+    notification = _notification_from_event_row(
+        {
+            "event_type": "NotificationRequested",
+            "aggregate_id": "order-100",
+            "payload": {
+                "message": "Order order-100 is ready at slot P-01. Token: PK-123456",
+                "channel": "demo",
+            },
+            "occurred_at": datetime(2026, 6, 9, 12, 0, tzinfo=UTC),
+        }
+    )
+
+    assert notification == {
+        "order_id": "order-100",
+        "message": "Order order-100 is ready at slot P-01. Token: PK-123456",
+        "channel": "demo",
+        "status": "Sent",
+        "sent_at": "2026-06-09T12:00:00+00:00",
+    }
