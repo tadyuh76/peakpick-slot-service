@@ -12,6 +12,9 @@ build/
 .env
 .env.*
 !.env.example
+.local-run-logs/
+.serena/
+*.docx
 
 # Course reference PDFs are kept locally and are not part of the project repo.
 docs/book/
