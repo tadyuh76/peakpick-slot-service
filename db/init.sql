@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS event_log (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE IF EXISTS event_log
+    ADD COLUMN IF NOT EXISTS store_id TEXT NOT NULL DEFAULT 'store-ueh';
+
 CREATE INDEX IF NOT EXISTS idx_event_log_correlation_id
     ON event_log (correlation_id);
 
@@ -43,6 +46,9 @@ CREATE TABLE IF NOT EXISTS carts (
     status TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE IF EXISTS carts
+    ADD COLUMN IF NOT EXISTS store_id TEXT NOT NULL DEFAULT 'store-ueh';
 
 CREATE TABLE IF NOT EXISTS cart_items (
     cart_id TEXT NOT NULL REFERENCES carts(cart_id) ON DELETE CASCADE,
@@ -62,6 +68,9 @@ CREATE TABLE IF NOT EXISTS orders (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE IF EXISTS orders
+    ADD COLUMN IF NOT EXISTS store_id TEXT NOT NULL DEFAULT 'store-ueh';
+
 CREATE INDEX IF NOT EXISTS idx_orders_store_created
     ON orders (store_id, created_at DESC);
 
@@ -80,12 +89,24 @@ CREATE TABLE IF NOT EXISTS pickup_windows (
     PRIMARY KEY (store_id, pickup_window)
 );
 
+ALTER TABLE IF EXISTS pickup_windows
+    ADD COLUMN IF NOT EXISTS store_id TEXT NOT NULL DEFAULT 'store-ueh';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pickup_windows_store_window
+    ON pickup_windows (store_id, pickup_window);
+
 CREATE TABLE IF NOT EXISTS pickup_slots (
     store_id TEXT NOT NULL REFERENCES stores(store_id),
     slot_id TEXT NOT NULL,
     active BOOLEAN NOT NULL DEFAULT true,
     PRIMARY KEY (store_id, slot_id)
 );
+
+ALTER TABLE IF EXISTS pickup_slots
+    ADD COLUMN IF NOT EXISTS store_id TEXT NOT NULL DEFAULT 'store-ueh';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pickup_slots_store_slot
+    ON pickup_slots (store_id, slot_id);
 
 CREATE TABLE IF NOT EXISTS slot_reservations (
     order_id TEXT PRIMARY KEY,
@@ -98,6 +119,9 @@ CREATE TABLE IF NOT EXISTS slot_reservations (
     FOREIGN KEY (store_id, slot_id) REFERENCES pickup_slots(store_id, slot_id),
     FOREIGN KEY (store_id, pickup_window) REFERENCES pickup_windows(store_id, pickup_window)
 );
+
+ALTER TABLE IF EXISTS slot_reservations
+    ADD COLUMN IF NOT EXISTS store_id TEXT NOT NULL DEFAULT 'store-ueh';
 
 CREATE INDEX IF NOT EXISTS idx_slot_reservations_store_window_status
     ON slot_reservations (store_id, pickup_window, status);
@@ -112,6 +136,9 @@ CREATE TABLE IF NOT EXISTS slot_reservation_blocks (
     reason TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE IF EXISTS slot_reservation_blocks
+    ADD COLUMN IF NOT EXISTS store_id TEXT NOT NULL DEFAULT 'store-ueh';
 
 INSERT INTO stores (store_id, name)
 VALUES
