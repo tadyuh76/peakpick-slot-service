@@ -10,15 +10,16 @@ from pydantic import BaseModel, Field
 
 from shared.event_bus import InMemoryEventBus, RabbitMQEventBus, build_event_bus
 from shared.events import EventEnvelope, EventType, new_event
-from shared.logging import configure_logging, log_event
+from shared.logging import configure_logging, install_api_logging, log_event
 from shared.settings import get_settings
+from shared.tenancy import DEFAULT_STORE_ID, store_id_from_event_payload, store_id_from_request
 
 
 settings = get_settings("slot-service")
 logger = configure_logging(settings.service_name)
 reservations: dict[str, dict[str, object]] = {}
 blocked_orders: set[str] = set()
-pickup_window_capacity_overrides: dict[str, int] = {}
+pickup_window_capacity_overrides: dict[tuple[str, str], int] = {}
 SLOT_COUNT = 32
 SLOT_STATUS_RANK = {
     "Reserved": 0,
@@ -58,9 +59,10 @@ def _pick_available_slot(order_id: str, used_slots: set[str], capacity: int = SL
     return None
 
 
-def _pickup_window_capacity(pickup_window: str) -> int:
-    if pickup_window in pickup_window_capacity_overrides:
-        return pickup_window_capacity_overrides[pickup_window]
+def _pickup_window_capacity(pickup_window: str, store_id: str = DEFAULT_STORE_ID) -> int:
+    override_key = (store_id, pickup_window)
+    if override_key in pickup_window_capacity_overrides:
+        return pickup_window_capacity_overrides[override_key]
     default = next(
         (item["capacity"] for item in DEFAULT_PICKUP_WINDOWS if item["pickup_window"] == pickup_window),
         SLOT_COUNT,
@@ -73,13 +75,16 @@ def assign_slot(
     pickup_window: str,
     state: dict[str, dict[str, object]],
     capacity: int | None = None,
+    store_id: str = DEFAULT_STORE_ID,
 ) -> str | None:
     used_slots = {
         str(reservation["slot_id"])
         for reservation in state.values()
-        if reservation["pickup_window"] == pickup_window and reservation["status"] != "Available"
+        if reservation["pickup_window"] == pickup_window
+        and reservation.get("store_id", DEFAULT_STORE_ID) == store_id
+        and reservation["status"] != "Available"
     }
-    return _pick_available_slot(order_id, used_slots, capacity or _pickup_window_capacity(pickup_window))
+    return _pick_available_slot(order_id, used_slots, capacity or _pickup_window_capacity(pickup_window, store_id))
 
 
 async def _get_reservation(order_id: str) -> dict[str, object] | None:
@@ -95,7 +100,7 @@ def _get_reservation_sync(order_id: str) -> dict[str, object] | None:
     with psycopg.connect(settings.database_url, row_factory=dict_row) as conn:
         row = conn.execute(
             """
-            SELECT order_id, slot_id, pickup_window, status, reserved_at, released_at
+            SELECT order_id, store_id, slot_id, pickup_window, status, reserved_at, released_at
             FROM slot_reservations
             WHERE order_id = %s
             """,
@@ -125,39 +130,42 @@ def _is_order_blocked_sync(order_id: str) -> bool:
         return row is not None
 
 
-async def _block_order_reservation(order_id: str, reason: str) -> None:
+async def _block_order_reservation(order_id: str, reason: str, store_id: str = DEFAULT_STORE_ID) -> None:
     if not _database_enabled():
         blocked_orders.add(order_id)
         return
-    await asyncio.to_thread(_block_order_reservation_sync, order_id, reason)
+    await asyncio.to_thread(_block_order_reservation_sync, order_id, reason, store_id)
 
 
-def _block_order_reservation_sync(order_id: str, reason: str) -> None:
+def _block_order_reservation_sync(order_id: str, reason: str, store_id: str) -> None:
     import psycopg
 
     with psycopg.connect(settings.database_url) as conn:
         conn.execute(
             """
-            INSERT INTO slot_reservation_blocks (order_id, reason)
-            VALUES (%s, %s)
+            INSERT INTO slot_reservation_blocks (order_id, store_id, reason)
+            VALUES (%s, %s, %s)
             ON CONFLICT (order_id) DO UPDATE
-                SET reason = EXCLUDED.reason
+                SET store_id = EXCLUDED.store_id,
+                    reason = EXCLUDED.reason
             """,
-            (order_id, reason),
+            (order_id, store_id, reason),
         )
 
 
-async def _used_slots_for_window(pickup_window: str) -> set[str]:
+async def _used_slots_for_window(pickup_window: str, store_id: str = DEFAULT_STORE_ID) -> set[str]:
     if not _database_enabled():
         return {
             str(reservation["slot_id"])
             for reservation in reservations.values()
-            if reservation["pickup_window"] == pickup_window and reservation["status"] != "Available"
+            if reservation["pickup_window"] == pickup_window
+            and reservation.get("store_id", DEFAULT_STORE_ID) == store_id
+            and reservation["status"] != "Available"
         }
-    return await asyncio.to_thread(_used_slots_for_window_sync, pickup_window)
+    return await asyncio.to_thread(_used_slots_for_window_sync, pickup_window, store_id)
 
 
-def _used_slots_for_window_sync(pickup_window: str) -> set[str]:
+def _used_slots_for_window_sync(pickup_window: str, store_id: str) -> set[str]:
     import psycopg
 
     with psycopg.connect(settings.database_url) as conn:
@@ -165,30 +173,31 @@ def _used_slots_for_window_sync(pickup_window: str) -> set[str]:
             """
             SELECT slot_id
             FROM slot_reservations
-            WHERE pickup_window = %s
+            WHERE store_id = %s
+              AND pickup_window = %s
               AND status <> 'Available'
             """,
-            (pickup_window,),
+            (store_id, pickup_window),
         ).fetchall()
         return {str(row[0]) for row in rows}
 
 
-def _ensure_pickup_slots_sync(capacity: int) -> None:
+def _ensure_pickup_slots_sync(capacity: int, store_id: str = DEFAULT_STORE_ID) -> None:
     import psycopg
 
     with psycopg.connect(settings.database_url) as conn:
-        _ensure_pickup_slots_in_transaction(conn, capacity)
+        _ensure_pickup_slots_in_transaction(conn, capacity, store_id)
 
 
-def _ensure_pickup_slots_in_transaction(conn, capacity: int) -> None:
+def _ensure_pickup_slots_in_transaction(conn, capacity: int, store_id: str) -> None:
     for index in range(1, capacity + 1):
         conn.execute(
             """
-            INSERT INTO pickup_slots (slot_id)
-            VALUES (%s)
-            ON CONFLICT (slot_id) DO NOTHING
+            INSERT INTO pickup_slots (store_id, slot_id)
+            VALUES (%s, %s)
+            ON CONFLICT (store_id, slot_id) DO NOTHING
             """,
-            (f"P-{index:02d}",),
+            (store_id, f"P-{index:02d}"),
         )
 
 
@@ -202,34 +211,36 @@ async def _save_reservation(reservation: dict[str, object]) -> None:
 def _save_reservation_sync(reservation: dict[str, object]) -> None:
     import psycopg
 
+    store_id = str(reservation.get("store_id", DEFAULT_STORE_ID))
     with psycopg.connect(settings.database_url) as conn:
         with conn.transaction():
             conn.execute(
                 """
-                INSERT INTO pickup_windows (pickup_window, capacity)
-                VALUES (%s, %s)
-                ON CONFLICT (pickup_window) DO NOTHING
+                INSERT INTO pickup_windows (store_id, pickup_window, capacity)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (store_id, pickup_window) DO NOTHING
                 """,
-                (reservation["pickup_window"], SLOT_COUNT),
+                (store_id, reservation["pickup_window"], SLOT_COUNT),
             )
             conn.execute(
                 """
-                INSERT INTO pickup_slots (slot_id)
-                VALUES (%s)
-                ON CONFLICT (slot_id) DO NOTHING
+                INSERT INTO pickup_slots (store_id, slot_id)
+                VALUES (%s, %s)
+                ON CONFLICT (store_id, slot_id) DO NOTHING
                 """,
-                (reservation["slot_id"],),
+                (store_id, reservation["slot_id"]),
             )
             conn.execute(
                 """
                 INSERT INTO slot_reservations (
-                    order_id, slot_id, pickup_window, status, reserved_at
+                    order_id, store_id, slot_id, pickup_window, status, reserved_at
                 )
-                VALUES (%s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (order_id) DO NOTHING
                 """,
                 (
                     reservation["order_id"],
+                    store_id,
                     reservation["slot_id"],
                     reservation["pickup_window"],
                     reservation["status"],
@@ -238,34 +249,43 @@ def _save_reservation_sync(reservation: dict[str, object]) -> None:
             )
 
 
-async def _reserve_slot_for_order(order_id: str, pickup_window: str) -> tuple[dict[str, object] | None, bool]:
-    return await asyncio.to_thread(_reserve_slot_for_order_sync, order_id, pickup_window)
+async def _reserve_slot_for_order(
+    order_id: str,
+    pickup_window: str,
+    store_id: str,
+) -> tuple[dict[str, object] | None, bool]:
+    return await asyncio.to_thread(_reserve_slot_for_order_sync, order_id, pickup_window, store_id)
 
 
-def _reserve_slot_for_order_sync(order_id: str, pickup_window: str) -> tuple[dict[str, object] | None, bool]:
+def _reserve_slot_for_order_sync(
+    order_id: str,
+    pickup_window: str,
+    store_id: str,
+) -> tuple[dict[str, object] | None, bool]:
     import psycopg
 
     with psycopg.connect(settings.database_url) as conn:
         with conn.transaction():
             # Same-window reservations must be serialized so two paid orders
             # cannot choose the same physical slot before either insert commits.
-            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (pickup_window,))
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"{store_id}:{pickup_window}",))
             conn.execute(
                 """
-                INSERT INTO pickup_windows (pickup_window, capacity)
-                VALUES (%s, %s)
-                ON CONFLICT (pickup_window) DO NOTHING
+                INSERT INTO pickup_windows (store_id, pickup_window, capacity)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (store_id, pickup_window) DO NOTHING
                 """,
-                (pickup_window, SLOT_COUNT),
+                (store_id, pickup_window, SLOT_COUNT),
             )
             capacity_row = conn.execute(
                 """
                 SELECT capacity
                 FROM pickup_windows
-                WHERE pickup_window = %s
+                WHERE store_id = %s
+                  AND pickup_window = %s
                 FOR UPDATE
                 """,
-                (pickup_window,),
+                (store_id, pickup_window),
             ).fetchone()
             capacity = int(capacity_row[0]) if capacity_row else SLOT_COUNT
             blocked = conn.execute(
@@ -294,18 +314,20 @@ def _reserve_slot_for_order_sync(order_id: str, pickup_window: str) -> tuple[dic
                 """
                 SELECT slot_id
                 FROM slot_reservations
-                WHERE pickup_window = %s
+                WHERE store_id = %s
+                  AND pickup_window = %s
                   AND status <> 'Available'
                 """,
-                (pickup_window,),
+                (store_id, pickup_window),
             ).fetchall()
             slot_id = _pick_available_slot(order_id, {str(row[0]) for row in used_rows}, capacity)
             if slot_id is None:
                 return None, False
 
-            _ensure_pickup_slots_in_transaction(conn, capacity)
+            _ensure_pickup_slots_in_transaction(conn, capacity, store_id)
             reservation = {
                 "order_id": order_id,
+                "store_id": store_id,
                 "slot_id": slot_id,
                 "pickup_window": pickup_window,
                 "status": "Reserved",
@@ -313,21 +335,22 @@ def _reserve_slot_for_order_sync(order_id: str, pickup_window: str) -> tuple[dic
             }
             conn.execute(
                 """
-                INSERT INTO pickup_slots (slot_id)
-                VALUES (%s)
-                ON CONFLICT (slot_id) DO NOTHING
+                INSERT INTO pickup_slots (store_id, slot_id)
+                VALUES (%s, %s)
+                ON CONFLICT (store_id, slot_id) DO NOTHING
                 """,
-                (slot_id,),
+                (store_id, slot_id),
             )
             conn.execute(
                 """
                 INSERT INTO slot_reservations (
-                    order_id, slot_id, pickup_window, status, reserved_at
+                    order_id, store_id, slot_id, pickup_window, status, reserved_at
                 )
-                VALUES (%s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
                 (
                     reservation["order_id"],
+                    reservation["store_id"],
                     reservation["slot_id"],
                     reservation["pickup_window"],
                     reservation["status"],
@@ -390,48 +413,62 @@ def _update_reservation_status_sync(order_id: str, status: str, released_at: str
             )
 
 
-async def _list_reservations() -> list[dict[str, object]]:
+async def _list_reservations(store_id: str | None = None) -> list[dict[str, object]]:
     if not _database_enabled():
-        return list(reservations.values())
-    return await asyncio.to_thread(_list_reservations_sync)
+        items = list(reservations.values())
+        return [item for item in items if item.get("store_id", DEFAULT_STORE_ID) == store_id] if store_id else items
+    return await asyncio.to_thread(_list_reservations_sync, store_id)
 
 
-def _list_reservations_sync() -> list[dict[str, object]]:
+def _list_reservations_sync(store_id: str | None = None) -> list[dict[str, object]]:
     import psycopg
     from psycopg.rows import dict_row
 
     with psycopg.connect(settings.database_url, row_factory=dict_row) as conn:
-        rows = conn.execute(
-            """
-            SELECT order_id, slot_id, pickup_window, status, reserved_at, released_at
-            FROM slot_reservations
-            ORDER BY reserved_at DESC
-            """
-        ).fetchall()
+        if store_id:
+            rows = conn.execute(
+                """
+                SELECT order_id, store_id, slot_id, pickup_window, status, reserved_at, released_at
+                FROM slot_reservations
+                WHERE store_id = %s
+                ORDER BY reserved_at DESC
+                """,
+                (store_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT order_id, store_id, slot_id, pickup_window, status, reserved_at, released_at
+                FROM slot_reservations
+                ORDER BY reserved_at DESC
+                """
+            ).fetchall()
         return [dict(row) for row in rows]
 
 
-async def _list_pickup_windows() -> list[dict[str, object]]:
+async def _list_pickup_windows(store_id: str = DEFAULT_STORE_ID) -> list[dict[str, object]]:
     if not _database_enabled():
         windows = [
             {
                 **window,
                 "capacity": pickup_window_capacity_overrides.get(
-                    str(window["pickup_window"]),
+                    (store_id, str(window["pickup_window"])),
                     int(window["capacity"]),
                 ),
             }
             for window in DEFAULT_PICKUP_WINDOWS
         ]
-        for pickup_window, capacity in pickup_window_capacity_overrides.items():
+        for (override_store_id, pickup_window), capacity in pickup_window_capacity_overrides.items():
+            if override_store_id != store_id:
+                continue
             if any(window["pickup_window"] == pickup_window for window in windows):
                 continue
             windows.append({"pickup_window": pickup_window, "capacity": capacity, "active": True})
         return windows
-    return await asyncio.to_thread(_list_pickup_windows_sync)
+    return await asyncio.to_thread(_list_pickup_windows_sync, store_id)
 
 
-def _list_pickup_windows_sync() -> list[dict[str, object]]:
+def _list_pickup_windows_sync(store_id: str) -> list[dict[str, object]]:
     import psycopg
     from psycopg.rows import dict_row
 
@@ -440,18 +477,27 @@ def _list_pickup_windows_sync() -> list[dict[str, object]]:
             """
             SELECT pickup_window, capacity, active
             FROM pickup_windows
+            WHERE store_id = %s
             ORDER BY pickup_window
             """
+            ,
+            (store_id,),
         ).fetchall()
         return [dict(row) for row in rows]
 
 
-async def _update_pickup_window_capacity(pickup_window: str, capacity: int) -> dict[str, object]:
+async def _update_pickup_window_capacity(
+    pickup_window: str,
+    capacity: int,
+    store_id: str = DEFAULT_STORE_ID,
+) -> dict[str, object]:
     if not _database_enabled():
         active_slot_numbers = [
             _slot_number(str(reservation["slot_id"]))
             for reservation in reservations.values()
-            if reservation["pickup_window"] == pickup_window and reservation["status"] != "Available"
+            if reservation["pickup_window"] == pickup_window
+            and reservation.get("store_id", DEFAULT_STORE_ID) == store_id
+            and reservation["status"] != "Available"
         ]
         minimum_capacity = max(active_slot_numbers, default=1)
         if capacity < minimum_capacity:
@@ -459,7 +505,7 @@ async def _update_pickup_window_capacity(pickup_window: str, capacity: int) -> d
                 status_code=409,
                 detail=f"Capacity must be at least {minimum_capacity} while active reservations exist",
             )
-        pickup_window_capacity_overrides[pickup_window] = capacity
+        pickup_window_capacity_overrides[(store_id, pickup_window)] = capacity
         default_window = next(
             (item for item in DEFAULT_PICKUP_WINDOWS if item["pickup_window"] == pickup_window),
             None,
@@ -470,12 +516,12 @@ async def _update_pickup_window_capacity(pickup_window: str, capacity: int) -> d
             "active": bool(default_window["active"]) if default_window else True,
         }
     try:
-        return await asyncio.to_thread(_update_pickup_window_capacity_sync, pickup_window, capacity)
+        return await asyncio.to_thread(_update_pickup_window_capacity_sync, pickup_window, capacity, store_id)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-def _update_pickup_window_capacity_sync(pickup_window: str, capacity: int) -> dict[str, object]:
+def _update_pickup_window_capacity_sync(pickup_window: str, capacity: int, store_id: str) -> dict[str, object]:
     import psycopg
     from psycopg.rows import dict_row
 
@@ -485,39 +531,45 @@ def _update_pickup_window_capacity_sync(pickup_window: str, capacity: int) -> di
                 """
                 SELECT slot_id
                 FROM slot_reservations
-                WHERE pickup_window = %s
+                WHERE store_id = %s
+                  AND pickup_window = %s
                   AND status <> 'Available'
                 """,
-                (pickup_window,),
+                (store_id, pickup_window),
             ).fetchall()
             minimum_capacity = max((_slot_number(str(row["slot_id"])) for row in rows), default=1)
             if capacity < minimum_capacity:
                 raise ValueError(f"Capacity must be at least {minimum_capacity} while active reservations exist")
 
-            _ensure_pickup_slots_in_transaction(conn, capacity)
+            _ensure_pickup_slots_in_transaction(conn, capacity, store_id)
             row = conn.execute(
                 """
-                INSERT INTO pickup_windows (pickup_window, capacity, active)
-                VALUES (%s, %s, true)
-                ON CONFLICT (pickup_window) DO UPDATE
+                INSERT INTO pickup_windows (store_id, pickup_window, capacity, active)
+                VALUES (%s, %s, %s, true)
+                ON CONFLICT (store_id, pickup_window) DO UPDATE
                     SET capacity = EXCLUDED.capacity
                 RETURNING pickup_window, capacity, active
                 """,
-                (pickup_window, capacity),
+                (store_id, pickup_window, capacity),
             ).fetchone()
             return dict(row)
 
 
-async def _list_slots() -> list[dict[str, object]]:
+async def _list_slots(store_id: str = DEFAULT_STORE_ID) -> list[dict[str, object]]:
     if not _database_enabled():
         max_capacity = max(
-            [int(item["capacity"]) for item in DEFAULT_PICKUP_WINDOWS] + list(pickup_window_capacity_overrides.values())
+            [int(item["capacity"]) for item in DEFAULT_PICKUP_WINDOWS]
+            + [
+                capacity
+                for (override_store_id, _pickup_window), capacity in pickup_window_capacity_overrides.items()
+                if override_store_id == store_id
+            ]
         )
         return [{"slot_id": f"P-{index:02d}", "active": True} for index in range(1, max_capacity + 1)]
-    return await asyncio.to_thread(_list_slots_sync)
+    return await asyncio.to_thread(_list_slots_sync, store_id)
 
 
-def _list_slots_sync() -> list[dict[str, object]]:
+def _list_slots_sync(store_id: str) -> list[dict[str, object]]:
     import psycopg
     from psycopg.rows import dict_row
 
@@ -526,8 +578,10 @@ def _list_slots_sync() -> list[dict[str, object]]:
             """
             SELECT slot_id, active
             FROM pickup_slots
+            WHERE store_id = %s
             ORDER BY slot_id
-            """
+            """,
+            (store_id,),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -537,13 +591,14 @@ async def handle_order_paid(
     event_bus: InMemoryEventBus | RabbitMQEventBus,
     state: dict[str, dict[str, object]] = reservations,
 ) -> None:
+    store_id = store_id_from_event_payload(event.payload)
     if _database_enabled():
         if await _get_reservation(event.aggregate_id):
             return
         if await _is_order_blocked(event.aggregate_id):
             return
         pickup_window = event.payload["pickup_window"]
-        reservation, already_handled = await _reserve_slot_for_order(event.aggregate_id, str(pickup_window))
+        reservation, already_handled = await _reserve_slot_for_order(event.aggregate_id, str(pickup_window), store_id)
         if already_handled:
             return
         slot_id = reservation["slot_id"] if reservation else None
@@ -553,7 +608,7 @@ async def handle_order_paid(
         return
     else:
         pickup_window = event.payload["pickup_window"]
-        slot_id = assign_slot(event.aggregate_id, str(pickup_window), state)
+        slot_id = assign_slot(event.aggregate_id, str(pickup_window), state, store_id=store_id)
 
     if slot_id is None:
         await event_bus.publish(
@@ -571,6 +626,7 @@ async def handle_order_paid(
     if not _database_enabled():
         reservation = {
             "order_id": event.aggregate_id,
+            "store_id": store_id,
             "slot_id": slot_id,
             "pickup_window": pickup_window,
             "status": "Reserved",
@@ -596,7 +652,11 @@ async def handle_status_event(
     reservation = await _get_reservation(event.aggregate_id) if _database_enabled() else state.get(event.aggregate_id)
     event_type = EventType(event.event_type)
     if event_type == EventType.INVENTORY_SHORTAGE_DETECTED:
-        await _block_order_reservation(event.aggregate_id, "InventoryShortageDetected")
+        await _block_order_reservation(
+            event.aggregate_id,
+            "InventoryShortageDetected",
+            store_id_from_event_payload(event.payload),
+        )
         if not reservation:
             return
     elif not reservation:
@@ -664,6 +724,7 @@ app = FastAPI(
     description="Pickup window capacity and slot assignment.",
     lifespan=lifespan,
 )
+install_api_logging(app, logger, settings.service_name)
 
 
 @app.get("/health")
@@ -676,25 +737,28 @@ async def health(request: Request) -> dict[str, object]:
 
 
 @app.get("/reservations")
-async def list_reservations() -> list[dict[str, object]]:
-    return await _list_reservations()
+async def list_reservations(request: Request) -> list[dict[str, object]]:
+    return await _list_reservations(store_id_from_request(request))
 
 
 @app.get("/pickup-windows")
-async def list_pickup_windows() -> list[dict[str, object]]:
-    return await _list_pickup_windows()
+async def list_pickup_windows(request: Request) -> list[dict[str, object]]:
+    return await _list_pickup_windows(store_id_from_request(request))
 
 
 @app.patch("/pickup-windows/{pickup_window}")
 async def update_pickup_window_capacity(
     pickup_window: str,
     payload: PickupWindowCapacityUpdate,
+    request: Request,
 ) -> dict[str, object]:
-    updated = await _update_pickup_window_capacity(pickup_window, payload.capacity)
+    store_id = store_id_from_request(request)
+    updated = await _update_pickup_window_capacity(pickup_window, payload.capacity, store_id)
     log_event(
         logger,
         settings.service_name,
         "pickup window capacity updated",
+        store_id=store_id,
         pickup_window=pickup_window,
         capacity=payload.capacity,
     )
@@ -702,5 +766,5 @@ async def update_pickup_window_capacity(
 
 
 @app.get("/slots")
-async def list_slots() -> list[dict[str, object]]:
-    return await _list_slots()
+async def list_slots(request: Request) -> list[dict[str, object]]:
+    return await _list_slots(store_id_from_request(request))
