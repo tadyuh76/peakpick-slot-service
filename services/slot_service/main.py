@@ -266,8 +266,8 @@ def _reserve_slot_for_order_sync(
 
     with psycopg.connect(settings.database_url) as conn:
         with conn.transaction():
-            # Same-window reservations must be serialized so two paid orders
-            # cannot choose the same physical slot before either insert commits.
+            # Phải tuần tự hóa reservation cùng khung giờ để hai đơn đã trả tiền
+            # không chọn cùng một ô trước khi transaction kịp commit.
             conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"{store_id}:{pickup_window}",))
             conn.execute(
                 """
