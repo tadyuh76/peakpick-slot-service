@@ -57,7 +57,18 @@ class RabbitMQEventBus:
     async def connect(self) -> None:
         import aio_pika
 
-        self.connection = await aio_pika.connect_robust(self.rabbitmq_url)
+        last_error: Exception | None = None
+        for attempt in range(1, 11):
+            try:
+                self.connection = await aio_pika.connect_robust(self.rabbitmq_url)
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt == 10:
+                    raise
+                await asyncio.sleep(min(attempt, 5))
+        if self.connection is None and last_error:
+            raise last_error
         self.channel = await self.connection.channel()
         self.exchange = await self.channel.declare_exchange(
             self.exchange_name,
@@ -105,6 +116,8 @@ class RabbitMQEventBus:
         async def on_message(message: Any) -> None:
             async with message.process(requeue=False):
                 event = EventEnvelope.model_validate_json(message.body)
+                if self.event_store:
+                    await self.event_store.append(event)
                 await handler(event)
 
         tag = await queue.consume(on_message)
