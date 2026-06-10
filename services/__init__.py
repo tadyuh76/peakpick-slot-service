@@ -1,1 +1,2 @@
-"""Các gói dịch vụ của PeakPick."""
+"""PeakPick service packages."""
+

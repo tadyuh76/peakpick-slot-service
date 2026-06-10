@@ -1,1 +1,2 @@
-"""Hàm hỗ trợ dùng chung cho các microservice PeakPick."""
+"""Shared helpers for PeakPick microservices."""
+

@@ -11,5 +11,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["uvicorn", "services.api_gateway.main:app", "--host", "0.0.0.0", "--port", "8000"]
-
+CMD ["uvicorn", "services.slot_service.main:app", "--host", "0.0.0.0", "--port", "8003"]

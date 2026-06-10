@@ -1,1 +1,2 @@
-"""Dịch vụ Slot."""
+"""Slot service."""
+
